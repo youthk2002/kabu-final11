@@ -38,60 +38,133 @@ function calcRSI(data,n=14){return data.map((d,i)=>{if(i<n)return{...d,rsi:null}
 function calcStoch(data,k=14,d=3){return data.map((d2,i)=>{if(i<k-1)return{...d2,stochK:null,stochD:null};const sl=data.slice(i-k+1,i+1),hh=Math.max(...sl.map(x=>x.high)),ll=Math.min(...sl.map(x=>x.low));const kVal=hh===ll?50:parseFloat(((d2.close-ll)/(hh-ll)*100).toFixed(1));const ds=[];for(let j=Math.max(k-1,i-d+1);j<=i;j++){const s2=data.slice(j-k+1,j+1),h2=Math.max(...s2.map(x=>x.high)),l2=Math.min(...s2.map(x=>x.low));ds.push(h2===l2?50:(data[j].close-l2)/(h2-l2)*100);}return{...d2,stochK:kVal,stochD:ds.length?parseFloat((ds.reduce((s,v)=>s+v,0)/ds.length).toFixed(1)):null};});}
 function applyIndicators(data){let d=calcMA(calcMA(data,5),25);d=calcBB(d);d=calcMACD(d);d=calcRSI(d);d=calcStoch(d);return d;}
 
-// ── シグナルスコア計算 ──────────────────────────────────
-function calcSignalScore(data) {
+
+// ── 指標重み学習システム ────────────────────────────────
+const DEFAULT_WEIGHTS = { rsi: 1.0, macd: 1.0, stoch: 1.0, ma: 1.0, bb: 0.5 };
+
+function loadWeights() {
+  try {
+    const s = localStorage.getItem("signal-weights-v1");
+    return s ? JSON.parse(s) : { ...DEFAULT_WEIGHTS };
+  } catch { return { ...DEFAULT_WEIGHTS }; }
+}
+
+function saveWeights(w) {
+  try { localStorage.setItem("signal-weights-v1", JSON.stringify(w)); } catch {}
+}
+
+function updateWeights(predictions) {
+  const verified = predictions.filter(p => p.result !== null && p.indicatorScores);
+  if (verified.length < 10) return loadWeights(); // データ不足
+
+  // 指標ごとの的中率を計算
+  const stats = { rsi:{hits:0,total:0}, macd:{hits:0,total:0}, stoch:{hits:0,total:0}, ma:{hits:0,total:0}, bb:{hits:0,total:0} };
+
+  verified.forEach(p => {
+    const hit = p.result === "hit";
+    Object.keys(stats).forEach(key => {
+      if (p.indicatorScores?.[key] !== undefined) {
+        stats[key].total++;
+        // 指標のスコアと実際の結果が一致していたら的中
+        const indDir = p.indicatorScores[key] > 0 ? "up" : p.indicatorScores[key] < 0 ? "down" : "neutral";
+        if (indDir === p.prediction && hit) stats[key].hits++;
+        if (indDir !== p.prediction && !hit) stats[key].hits++; // 逆張り成功も的中
+      }
+    });
+  });
+
+  // 重みを更新（的中率に基づいて0.3〜2.0の範囲で調整）
+  const newWeights = { ...DEFAULT_WEIGHTS };
+  Object.keys(stats).forEach(key => {
+    const s = stats[key];
+    if (s.total >= 5) {
+      const rate = s.hits / s.total;
+      // 的中率50%を基準に重みを調整
+      newWeights[key] = Math.max(0.3, Math.min(2.0, rate * 2));
+    }
+  });
+
+  saveWeights(newWeights);
+  return newWeights;
+}
+
+// ── シグナルスコア計算（重み学習対応）──────────────────
+function calcSignalScore(data, weights) {
   if(data.length < 26) return null;
+  const w = weights || DEFAULT_WEIGHTS;
   const lr = data[data.length-1];
   const prev = data[data.length-2];
-  let score = 0, details = [];
+  let score = 0;
+  const details = [];
+  const indicatorScores = {};
 
   // RSI
   if(lr.rsi != null) {
-    if(lr.rsi < 30)      { score += 2; details.push({name:"RSI",signal:"強い買い",score:+2,color:"#22c55e"}); }
-    else if(lr.rsi < 45) { score += 1; details.push({name:"RSI",signal:"買い",score:+1,color:"#86efac"}); }
-    else if(lr.rsi > 70) { score -= 2; details.push({name:"RSI",signal:"強い売り",score:-2,color:"#ef4444"}); }
-    else if(lr.rsi > 55) { score -= 1; details.push({name:"RSI",signal:"売り",score:-1,color:"#fca5a5"}); }
-    else                  { details.push({name:"RSI",signal:"中立",score:0,color:"#94a3b8"}); }
+    let s = 0, sig = "中立", color = "#94a3b8";
+    if(lr.rsi < 30)      { s = 2;  sig = "強い買い"; color = "#22c55e"; }
+    else if(lr.rsi < 45) { s = 1;  sig = "買い";     color = "#86efac"; }
+    else if(lr.rsi > 70) { s = -2; sig = "強い売り"; color = "#ef4444"; }
+    else if(lr.rsi > 55) { s = -1; sig = "売り";     color = "#fca5a5"; }
+    const ws = parseFloat((s * w.rsi).toFixed(2));
+    score += ws;
+    indicatorScores.rsi = ws;
+    details.push({name:"RSI", signal:sig, score:ws, rawScore:s, weight:w.rsi, color});
   }
 
   // MACD
   if(lr.macd != null && lr.macdSig != null) {
+    let s = 0, sig = "下降", color = "#fca5a5";
     const cross = lr.macd > lr.macdSig && prev?.macd <= prev?.macdSig;
     const dcross = lr.macd < lr.macdSig && prev?.macd >= prev?.macdSig;
-    if(cross)             { score += 2; details.push({name:"MACD",signal:"ゴールデンクロス",score:+2,color:"#22c55e"}); }
-    else if(dcross)       { score -= 2; details.push({name:"MACD",signal:"デッドクロス",score:-2,color:"#ef4444"}); }
-    else if(lr.macd > lr.macdSig) { score += 1; details.push({name:"MACD",signal:"上昇",score:+1,color:"#86efac"}); }
-    else                  { score -= 1; details.push({name:"MACD",signal:"下降",score:-1,color:"#fca5a5"}); }
+    if(cross)                    { s = 2;  sig = "ゴールデンクロス"; color = "#22c55e"; }
+    else if(dcross)              { s = -2; sig = "デッドクロス";     color = "#ef4444"; }
+    else if(lr.macd > lr.macdSig){ s = 1;  sig = "上昇";            color = "#86efac"; }
+    const ws = parseFloat((s * w.macd).toFixed(2));
+    score += ws;
+    indicatorScores.macd = ws;
+    details.push({name:"MACD", signal:sig, score:ws, rawScore:s, weight:w.macd, color});
   }
 
   // ストキャス
   if(lr.stochK != null) {
-    if(lr.stochK < 20)   { score += 2; details.push({name:"ストキャス",signal:"売られすぎ",score:+2,color:"#22c55e"}); }
-    else if(lr.stochK > 80){ score -= 2; details.push({name:"ストキャス",signal:"買われすぎ",score:-2,color:"#ef4444"}); }
-    else if(lr.stochK > lr.stochD){ score += 1; details.push({name:"ストキャス",signal:"上向き",score:+1,color:"#86efac"}); }
-    else                  { score -= 1; details.push({name:"ストキャス",signal:"下向き",score:-1,color:"#fca5a5"}); }
+    let s = 0, sig = "中立", color = "#94a3b8";
+    if(lr.stochK < 20)          { s = 2;  sig = "売られすぎ"; color = "#22c55e"; }
+    else if(lr.stochK > 80)     { s = -2; sig = "買われすぎ"; color = "#ef4444"; }
+    else if(lr.stochK > lr.stochD){ s = 1; sig = "上向き";   color = "#86efac"; }
+    else                         { s = -1; sig = "下向き";    color = "#fca5a5"; }
+    const ws = parseFloat((s * w.stoch).toFixed(2));
+    score += ws;
+    indicatorScores.stoch = ws;
+    details.push({name:"ストキャス", signal:sig, score:ws, rawScore:s, weight:w.stoch, color});
   }
 
   // 移動平均
   if(lr.ma5 && lr.ma25) {
-    if(lr.ma5 > lr.ma25 && prev?.ma5 <= prev?.ma25){ score += 2; details.push({name:"MA",signal:"ゴールデンクロス",score:+2,color:"#22c55e"}); }
-    else if(lr.ma5 < lr.ma25 && prev?.ma5 >= prev?.ma25){ score -= 2; details.push({name:"MA",signal:"デッドクロス",score:-2,color:"#ef4444"}); }
-    else if(lr.ma5 > lr.ma25){ score += 1; details.push({name:"MA",signal:"上昇トレンド",score:+1,color:"#86efac"}); }
-    else { score -= 1; details.push({name:"MA",signal:"下降トレンド",score:-1,color:"#fca5a5"}); }
+    let s = 0, sig = "下降トレンド", color = "#fca5a5";
+    if(lr.ma5 > lr.ma25 && prev?.ma5 <= prev?.ma25)      { s = 2;  sig = "ゴールデンクロス"; color = "#22c55e"; }
+    else if(lr.ma5 < lr.ma25 && prev?.ma5 >= prev?.ma25) { s = -2; sig = "デッドクロス";     color = "#ef4444"; }
+    else if(lr.ma5 > lr.ma25)                             { s = 1;  sig = "上昇トレンド";     color = "#86efac"; }
+    const ws = parseFloat((s * w.ma).toFixed(2));
+    score += ws;
+    indicatorScores.ma = ws;
+    details.push({name:"MA", signal:sig, score:ws, rawScore:s, weight:w.ma, color});
   }
 
   // ボリンジャー
   if(lr.bbUpper && lr.bbLower) {
-    const range = lr.bbUpper - lr.bbLower;
-    const pos = (lr.close - lr.bbLower) / range;
-    if(pos < 0.1)       { score += 1; details.push({name:"BB",signal:"下限付近",score:+1,color:"#86efac"}); }
-    else if(pos > 0.9)  { score -= 1; details.push({name:"BB",signal:"上限付近",score:-1,color:"#fca5a5"}); }
-    else                { details.push({name:"BB",signal:"中間",score:0,color:"#94a3b8"}); }
+    const pos = (lr.close - lr.bbLower) / (lr.bbUpper - lr.bbLower);
+    let s = 0, sig = "中間", color = "#94a3b8";
+    if(pos < 0.1)      { s = 1;  sig = "下限付近"; color = "#86efac"; }
+    else if(pos > 0.9) { s = -1; sig = "上限付近"; color = "#fca5a5"; }
+    const ws = parseFloat((s * w.bb).toFixed(2));
+    score += ws;
+    indicatorScores.bb = ws;
+    details.push({name:"BB", signal:sig, score:ws, rawScore:s, weight:w.bb, color});
   }
 
-  const maxScore = 10;
-  const prediction = score >= 2 ? "up" : score <= -2 ? "down" : "neutral";
-  return { score, maxScore, prediction, details };
+  const maxScore = parseFloat((10 * Math.max(...Object.values(w))).toFixed(1));
+  const prediction = score >= 1.5 ? "up" : score <= -1.5 ? "down" : "neutral";
+  return { score: parseFloat(score.toFixed(2)), maxScore, prediction, details, indicatorScores, weights: w };
 }
 
 // ── ユーティリティ ──────────────────────────────────────
@@ -111,7 +184,7 @@ function loadPredictions(){try{const s=localStorage.getItem("predictions-v1");re
 function savePredictions(preds){try{localStorage.setItem("predictions-v1",JSON.stringify(preds));}catch{}}
 
 // ── 予測・的中率コンポーネント ──────────────────────────
-function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSelectStock}){
+function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSelectStock, onAutoPred, autoRunning, autoProgress}){
   const [predictions, setPredictions] = useState(loadPredictions);
   const [verifying,   setVerifying]   = useState(false);
   const [dailyTab,    setDailyTab]    = useState("summary"); // summary | daily | history
@@ -123,17 +196,90 @@ function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSel
       symbol, name, market,
       prediction: signalScore.prediction,
       score: signalScore.score,
+      indicatorScores: signalScore.indicatorScores,
+      weightsAtPrediction: signalScore.weights,
       priceAtPrediction: currentPrice,
       predictedAt: new Date().toISOString(),
       verifiedAt: null,
       priceAtVerification: null,
       result: null,
       horizon: 7,
+      isAuto: false,
     };
     const updated = [newPred, ...predictions].slice(0, 200);
     setPredictions(updated);
     savePredictions(updated);
     alert("予測を記録しました！\n7日後に「結果を検証」を押してください。");
+  }
+
+  // 自動予測：主要銘柄を自動スキャンして予測を記録
+  const [autoRunning, setAutoRunning] = useState(false);
+  const [autoProgress, setAutoProgress] = useState("");
+
+  const AUTO_SYMBOLS = [
+    {symbol:"7203.T",name:"トヨタ自動車",market:"JP"},
+    {symbol:"6758.T",name:"ソニーグループ",market:"JP"},
+    {symbol:"7974.T",name:"任天堂",market:"JP"},
+    {symbol:"8306.T",name:"三菱UFJ",market:"JP"},
+    {symbol:"285A.T",name:"キオクシアHD",market:"JP"},
+    {symbol:"9984.T",name:"ソフトバンクG",market:"JP"},
+    {symbol:"6368.T",name:"オルガノ",market:"JP"},
+    {symbol:"6370.T",name:"栗田工業",market:"JP"},
+    {symbol:"8035.T",name:"東京エレクトロン",market:"JP"},
+    {symbol:"6861.T",name:"キーエンス",market:"JP"},
+    {symbol:"AAPL",name:"Apple Inc.",market:"US"},
+    {symbol:"NVDA",name:"NVIDIA Corporation",market:"US"},
+    {symbol:"TSLA",name:"Tesla, Inc.",market:"US"},
+    {symbol:"MSFT",name:"Microsoft Corporation",market:"US"},
+    {symbol:"AMZN",name:"Amazon.com, Inc.",market:"US"},
+  ];
+
+  async function runAutoPrediction(){
+    setAutoRunning(true);
+    const today = new Date().toISOString().slice(0,10);
+    const existing = loadPredictions();
+    let added = 0;
+    const newPreds = [...existing];
+
+    for(const stock of AUTO_SYMBOLS){
+      // 今日すでに同じ銘柄の自動予測があればスキップ
+      const alreadyToday = existing.some(p=>p.symbol===stock.symbol&&p.isAuto&&p.predictedAt.slice(0,10)===today);
+      if(alreadyToday) continue;
+
+      setAutoProgress(`${stock.name} を分析中... (${added}/${AUTO_SYMBOLS.length})`);
+      try{
+        const r = await fetch(`/api/stock?symbol=${stock.symbol}&period=3mo`);
+        const j = await r.json();
+        if(!j.rows||j.rows.length<26) continue;
+        let d = j.rows;
+        d = (() => {
+          let x=calcMA(calcMA(d,5),25);x=calcBB(x);x=calcMACD(x);x=calcRSI(x);x=calcStoch(x);return x;
+        })();
+        const sc = calcSignalScore(d, loadWeights());
+        if(!sc||sc.prediction==="neutral") continue; // 中立はスキップ
+        const cur = j.meta?.current || d[d.length-1]?.close;
+        if(!cur) continue;
+        newPreds.unshift({
+          id: Date.now() + Math.random(),
+          symbol: stock.symbol, name: stock.name, market: stock.market,
+          prediction: sc.prediction, score: sc.score,
+          indicatorScores: sc.indicatorScores, weightsAtPrediction: sc.weights,
+          priceAtPrediction: cur,
+          predictedAt: new Date().toISOString(),
+          verifiedAt: null, priceAtVerification: null, result: null,
+          horizon: 7, isAuto: true,
+        });
+        added++;
+      }catch{}
+      await new Promise(r=>setTimeout(r,400));
+    }
+
+    const trimmed = newPreds.slice(0,200);
+    setPredictions(trimmed);
+    savePredictions(trimmed);
+    setAutoRunning(false);
+    setAutoProgress("");
+    alert(`自動予測完了！\n${added}銘柄の予測を記録しました。`);
   }
 
   async function verifyAll(){
@@ -160,6 +306,9 @@ function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSel
     }
     setPredictions(updated);
     savePredictions(updated);
+    // 検証後に重みを再学習
+    const newWeights = updateWeights(updated);
+    saveWeights(newWeights);
     setVerifying(false);
   }
 
@@ -195,13 +344,25 @@ function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSel
       {/* シグナルスコア */}
       {signalScore&&(
         <div style={{background:"#1e293b",borderRadius:10,padding:14,marginBottom:10}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:6}}>
             <span style={{fontSize:13,fontWeight:700,color:"#f1f5f9"}}>🎯 シグナルスコア</span>
-            <button onClick={savePrediction}
-              style={{background:"#3b82f6",border:"none",borderRadius:7,padding:"5px 14px",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
-              📝 予測を記録
-            </button>
+            <div style={{display:"flex",gap:6}}>
+              <button onClick={onAutoPred} disabled={autoRunning}
+                style={{background:autoRunning?"#334155":"#10b981",border:"none",borderRadius:7,padding:"5px 12px",
+                  color:autoRunning?"#64748b":"#fff",fontSize:11,fontWeight:700,cursor:autoRunning?"default":"pointer"}}>
+                {autoRunning?"自動分析中...":"🤖 自動予測"}
+              </button>
+              <button onClick={savePrediction}
+                style={{background:"#3b82f6",border:"none",borderRadius:7,padding:"5px 12px",color:"#fff",fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                📝 手動記録
+              </button>
+            </div>
           </div>
+          {autoRunning&&autoProgress&&(
+            <div style={{background:"#0f172a",borderRadius:6,padding:"6px 10px",marginBottom:8,fontSize:11,color:"#10b981"}}>
+              ⏳ {autoProgress}
+            </div>
+          )}
           <div style={{marginBottom:12}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
               <span style={{fontSize:12,color:"#94a3b8"}}>総合スコア</span>
@@ -224,10 +385,22 @@ function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSel
           <div style={{display:"flex",flexDirection:"column",gap:5}}>
             {signalScore.details.map((d,i)=>(
               <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"#0f172a",borderRadius:6,padding:"6px 10px"}}>
-                <span style={{fontSize:12,color:"#64748b"}}>{d.name}</span>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span style={{fontSize:12,color:"#64748b"}}>{d.name}</span>
+                  {d.weight!==undefined&&d.weight!==1.0&&(
+                    <span style={{fontSize:9,background:d.weight>1?"#22c55e22":"#ef444422",color:d.weight>1?"#22c55e":"#ef4444",borderRadius:4,padding:"1px 4px"}}>
+                      x{d.weight.toFixed(1)}
+                    </span>
+                  )}
+                </div>
                 <span style={{fontSize:12,fontWeight:700,color:d.color}}>{d.signal} {d.score>0?`+${d.score}`:d.score===0?"±0":d.score}</span>
               </div>
             ))}
+            {/* 学習状況 */}
+            <div style={{marginTop:8,padding:"6px 10px",background:"#0f172a",borderRadius:6,fontSize:10,color:"#64748b"}}>
+              🧠 学習状況: {loadPredictions().filter(p=>p.result!==null).length}件の検証データで重みを自動調整中
+              {loadPredictions().filter(p=>p.result!==null).length < 10 && " (10件以上で学習開始)"}
+            </div>
           </div>
           <div style={{marginTop:8,fontSize:10,color:"#475569"}}>※テクニカル分析に基づく参考情報。投資判断はご自身の責任で。</div>
         </div>
@@ -242,6 +415,7 @@ function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSel
               style={{background:verifying?"#334155":"#10b981",border:"none",borderRadius:6,padding:"5px 12px",color:"#fff",fontSize:11,fontWeight:700,cursor:verifying?"default":"pointer"}}>
               {verifying?"検証中...":"🔄 結果を検証"}
             </button>
+            <button onClick={()=>{saveWeights({...DEFAULT_WEIGHTS});setVerifying(false);alert("重みをリセットしました");}} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:6,padding:"5px 10px",color:"#64748b",fontSize:11,cursor:"pointer"}}>重みリセット</button>
             <button onClick={clearAll} style={{background:"#450a0a",border:"none",borderRadius:6,padding:"5px 10px",color:"#ef4444",fontSize:11,cursor:"pointer"}}>クリア</button>
           </div>
         </div>
@@ -335,7 +509,10 @@ function PredictionPanel({symbol, name, market, signalScore, currentPrice, onSel
                         <div style={{flex:1}}>
                           <button onClick={()=>onSelectStock({symbol:p.symbol,name:p.name,market:p.market})}
                             style={{background:"none",border:"none",padding:0,cursor:"pointer",textAlign:"left"}}>
-                            <div style={{fontSize:12,fontWeight:700,color:"#3b82f6",textDecoration:"underline"}}>{p.name}</div>
+                            <div style={{display:"flex",alignItems:"center",gap:5}}>
+                            <span style={{fontSize:12,fontWeight:700,color:"#3b82f6",textDecoration:"underline"}}>{p.name}</span>
+                            <span style={{fontSize:9,background:p.isAuto?"#10b98122":"#3b82f622",color:p.isAuto?"#10b981":"#3b82f6",borderRadius:4,padding:"1px 5px"}}>{p.isAuto?"自動":"手動"}</span>
+                          </div>
                           </button>
                           <div style={{fontSize:10,color:"#64748b",marginTop:1}}>
                             {p.prediction==="up"?"📈 上昇予測":p.prediction==="down"?"📉 下降予測":"➡️ 中立"} · {new Date(p.predictedAt).toLocaleDateString("ja-JP")}
@@ -794,6 +971,7 @@ export default function App() {
   const [showPred,   setShowPred]  = useState(false);
   const [fxRate,     setFxRate]    = useState(150.0);
   const [showJPY,    setShowJPY]   = useState(false);
+  const [weights,    setWeights]   = useState(()=>loadWeights());
 
   const period=PERIODS[periodIdx];
   const is1d=period.value==="1d";
@@ -822,6 +1000,13 @@ export default function App() {
     fetch("/api/fx").then(r=>r.json()).then(j=>{ if(j.rate) setFxRate(j.rate); }).catch(()=>{});
   },[]);
 
+  // 予測データから重みを更新
+  useEffect(()=>{
+    const preds = loadPredictions();
+    const newWeights = updateWeights(preds);
+    setWeights(newWeights);
+  },[]);
+
   const data=is1d?rawData:applyIndicators(rawData);
   const first=data[0]?.close,last=data[data.length-1]?.close;
   const change=first&&last?((last-first)/first*100):null;
@@ -829,7 +1014,7 @@ export default function App() {
   const minY=data.length?Math.min(...data.map(d=>(!is1d&&d.bbLower)||d.low))*0.995:0;
   const maxY=data.length?Math.max(...data.map(d=>(!is1d&&d.bbUpper)||d.high))*1.005:0;
   const lr=data[data.length-1];
-  const signalScore=!is1d&&data.length>=26?calcSignalScore(data):null;
+  const signalScore=!is1d&&data.length>=26?calcSignalScore(data,weights):null;
   const rsiSig=lr?.rsi>70?{v:"買われすぎ",t:"sell"}:lr?.rsi<30?{v:"売られすぎ",t:"buy"}:{v:"中立",t:"neutral"};
   const macdSig=lr?.macd>lr?.macdSig?{v:"上昇",t:"buy"}:{v:"下降",t:"sell"};
   const stochSig=lr?.stochK>80?{v:"買われすぎ",t:"sell"}:lr?.stochK<20?{v:"売られすぎ",t:"buy"}:{v:"中立",t:"neutral"};
@@ -943,7 +1128,7 @@ export default function App() {
               <span style={{fontSize:13,fontWeight:700,color:"#f1f5f9"}}>🎯 シグナルスコア・予測管理</span>
               <span style={{color:"#64748b"}}>{showPred?"▲":"▼"}</span>
             </button>
-            {showPred&&<PredictionPanel symbol={selected?.symbol} name={metaInfo?.name||selected?.name} market={selected?.market} signalScore={signalScore} currentPrice={last} onSelectStock={selectStock}/>}
+            {showPred&&<PredictionPanel symbol={selected?.symbol} name={metaInfo?.name||selected?.name} market={selected?.market} signalScore={signalScore} currentPrice={last} onSelectStock={selectStock} onAutoPred={runAutoPrediction} autoRunning={autoRunning} autoProgress={autoProgress}/>}
 
             {/* ニュース */}
             <div style={{background:"#1e293b",borderRadius:10,padding:14,marginBottom:8}}>
